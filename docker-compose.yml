@@ -1,16 +1,20 @@
-# OmniRoute — hardened Docker Compose
+# OmniRoute — hardened home-LAN Docker Compose
 #
-# Security posture:
-# - dashboard/API/WebSocket bind to loopback only
-# - sidecars are reachable only on the internal Docker network
-# - no Docker socket, repository, home-directory or credential mounts
-# - no privileged CLI/host profiles
-# - read-only root filesystem where supported
-# - all Linux capabilities dropped and no-new-privileges enabled
+# Goals:
+# - reachable by authorized clients on a selected LAN address
+# - outbound access to model providers and explicitly authorized LAN services
+# - sidecars remain private to Docker
+# - optional agent profile can run CLIs and deploy over SSH/API/Kubernetes
+# - no Docker socket and no host home-directory mounts
 #
-# Start with:
+# Start:
 #   cp .env.security.example .env
 #   docker compose --profile base up -d
+#
+# Agent mode (use instead of base):
+#   mkdir -p data agent-workspace agent-home
+#   chmod 700 data agent-workspace agent-home
+#   docker compose --profile agent up -d
 
 x-common: &common
   restart: unless-stopped
@@ -21,19 +25,16 @@ x-common: &common
     - no-new-privileges:true
   cap_drop:
     - ALL
-  read_only: true
-  tmpfs:
-    - /tmp:rw,noexec,nosuid,nodev,size=256m
-    - /app/.next/cache:rw,noexec,nosuid,nodev,size=256m
   environment:
     DATA_DIR: /app/data
     PORT: ${PORT:-20128}
     DASHBOARD_PORT: ${DASHBOARD_PORT:-20128}
     API_PORT: ${API_PORT:-20129}
-    API_HOST: 127.0.0.1
+    # Bind inside the container; host exposure is restricted by OMNIROUTE_BIND_IP below.
+    API_HOST: 0.0.0.0
     LIVE_WS_PORT: ${LIVE_WS_PORT:-20132}
-    LIVE_WS_HOST: 127.0.0.1
-    LIVE_WS_ALLOWED_ORIGINS: ${LIVE_WS_ALLOWED_ORIGINS:-http://localhost:20128,http://127.0.0.1:20128}
+    LIVE_WS_HOST: 0.0.0.0
+    LIVE_WS_ALLOWED_ORIGINS: ${LIVE_WS_ALLOWED_ORIGINS:?Set LIVE_WS_ALLOWED_ORIGINS to your trusted dashboard origins}
     REDIS_URL: redis://redis:6379
     REQUIRE_API_KEY: "true"
     CLOUD_URL: ""
@@ -43,12 +44,19 @@ x-common: &common
     - ./data:/app/data:rw
   networks:
     - omniroute-internal
+    - omniroute-egress
   healthcheck:
     test: ["CMD", "node", "healthcheck.mjs"]
     interval: 30s
     timeout: 5s
     retries: 3
     start_period: 15s
+
+x-published-ports: &published-ports
+  ports:
+    - "${OMNIROUTE_BIND_IP:-127.0.0.1}:${DASHBOARD_PORT:-20128}:${DASHBOARD_PORT:-20128}"
+    - "${OMNIROUTE_BIND_IP:-127.0.0.1}:${API_PORT:-20129}:${API_PORT:-20129}"
+    - "${OMNIROUTE_BIND_IP:-127.0.0.1}:${LIVE_WS_PORT:-20132}:${LIVE_WS_PORT:-20132}"
 
 services:
   redis:
@@ -73,33 +81,74 @@ services:
       timeout: 5s
       retries: 3
 
+  # Standard gateway. External tools connect to this service through the selected LAN IP.
   omniroute-base:
-    <<: *common
+    <<: [*common, *published-ports]
     container_name: omniroute
     build:
       context: .
       target: runner-base
     image: omniroute:base
-    ports:
-      - "127.0.0.1:${DASHBOARD_PORT:-20128}:${DASHBOARD_PORT:-20128}"
-      - "127.0.0.1:${API_PORT:-20129}:${API_PORT:-20129}"
-      - "127.0.0.1:${LIVE_WS_PORT:-20132}:${LIVE_WS_PORT:-20132}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=256m
     profiles: ["base"]
 
+  # Browser-backed providers, still LAN-restricted and without host credentials.
   omniroute-web:
-    <<: *common
+    <<: [*common, *published-ports]
     container_name: omniroute
     build:
       context: .
       target: runner-web
     image: omniroute:web
-    # Chromium requires writable shared memory. Keep it isolated from the host.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=256m
     shm_size: 1gb
-    ports:
-      - "127.0.0.1:${DASHBOARD_PORT:-20128}:${DASHBOARD_PORT:-20128}"
-      - "127.0.0.1:${API_PORT:-20129}:${API_PORT:-20129}"
-      - "127.0.0.1:${LIVE_WS_PORT:-20132}:${LIVE_WS_PORT:-20132}"
     profiles: ["web"]
+
+  # Operational agent profile.
+  # It can reach your LAN and the Internet, execute packaged CLIs and write only to
+  # dedicated agent directories. Deploy through SSH, HTTPS APIs, GitOps or kubeconfig.
+  # It deliberately receives no /var/run/docker.sock and no ~/.claude/~/.codex host mounts.
+  omniroute-agent:
+    <<: [*common, *published-ports]
+    container_name: omniroute
+    build:
+      context: .
+      target: runner-cli
+    image: omniroute:agent
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=256m
+    volumes:
+      - ./data:/app/data:rw
+      - ./agent-workspace:/workspace:rw
+      - ./agent-home:/home/node:rw
+    environment:
+      DATA_DIR: /app/data
+      PORT: ${PORT:-20128}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-20128}
+      API_PORT: ${API_PORT:-20129}
+      API_HOST: 0.0.0.0
+      LIVE_WS_PORT: ${LIVE_WS_PORT:-20132}
+      LIVE_WS_HOST: 0.0.0.0
+      LIVE_WS_ALLOWED_ORIGINS: ${LIVE_WS_ALLOWED_ORIGINS:?Set LIVE_WS_ALLOWED_ORIGINS to your trusted dashboard origins}
+      REDIS_URL: redis://redis:6379
+      REQUIRE_API_KEY: "true"
+      CLOUD_URL: ""
+      NEXT_PUBLIC_CLOUD_URL: ""
+      OMNIROUTE_CLOUD_SYNC_SECRETS: "false"
+      HOME: /home/node
+      CLI_CONFIG_HOME: /home/node
+      CLI_ALLOW_CONFIG_WRITES: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles: ["agent"]
 
   qdrant:
     image: docker.io/qdrant/qdrant:v1.12.4
@@ -114,17 +163,9 @@ services:
     environment:
       QDRANT__SERVICE__GRPC_PORT: 6334
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required for the memory profile}
-    expose:
-      - "6333"
-      - "6334"
+    expose: ["6333", "6334"]
     networks:
       - omniroute-internal
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:6333/readyz"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     profiles: ["memory"]
 
   bifrost:
@@ -139,16 +180,9 @@ services:
       - bifrost-data:/data
     environment:
       BIFROST_LOG_LEVEL: ${BIFROST_LOG_LEVEL:-warning}
-    expose:
-      - "8080"
+    expose: ["8080"]
     networks:
       - omniroute-internal
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/v1/models"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
     profiles: ["bifrost"]
 
   cliproxyapi:
@@ -164,22 +198,19 @@ services:
     environment:
       PORT: ${CLIPROXYAPI_PORT:-8317}
       HOST: 0.0.0.0
-    expose:
-      - "8317"
+    expose: ["8317"]
     networks:
       - omniroute-internal
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:${CLIPROXYAPI_PORT:-8317}/v1/models"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     profiles: ["cliproxyapi"]
 
 networks:
+  # Sidecars live here. No direct route outside Docker.
   omniroute-internal:
     name: omniroute-internal
     internal: true
+  # OmniRoute itself joins this network for model providers and approved LAN targets.
+  omniroute-egress:
+    name: omniroute-egress
 
 volumes:
   cliproxyapi-data:
