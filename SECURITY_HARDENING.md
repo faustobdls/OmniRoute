@@ -1,18 +1,56 @@
-# OmniRoute hardened deployment
+# OmniRoute hardened home-LAN deployment
 
-This branch changes the default Docker posture from convenience-first to security-first. It is designed for a dedicated VM or host and assumes access through a local reverse proxy or SSH tunnel.
+This branch is designed for a dedicated VM inside a trusted home VLAN. The goal is not to isolate OmniRoute from the network: authorized clients and the operational agent must be able to reach infrastructure services. The goal is to keep that access explicit, authenticated and separated from unrestricted host control.
 
-## What is enforced
+## Security model
 
-- Dashboard, API and live WebSocket ports publish only on `127.0.0.1`.
-- Redis, Qdrant, Bifrost and CLIProxyAPI are not published on the host.
-- The dangerous `cli` and `host` Compose profiles were removed.
-- No Docker socket, source repository, AI CLI home or host credential directory is mounted.
-- Containers drop all Linux capabilities and use `no-new-privileges`.
-- The OmniRoute root filesystem is read-only, with explicit writable mounts only for data and temporary files.
-- API-key authentication is forced in Compose.
-- Cloud sync endpoints are forced empty in Compose.
-- Qdrant authentication is mandatory before enabling the memory profile.
+- Dashboard, API and WebSocket publish only on the address configured by `OMNIROUTE_BIND_IP`.
+- `OMNIROUTE_BIND_IP` should be the VM/server address on the trusted management or services VLAN, never `0.0.0.0`.
+- API-key authentication remains mandatory on the LAN.
+- OmniRoute has outbound connectivity for model providers and authorized LAN services.
+- Redis, Qdrant, Bifrost and CLIProxyAPI remain private to the internal Docker network.
+- Containers drop Linux capabilities and use `no-new-privileges`.
+- Cloud sync remains disabled; normal AI-provider connections remain available.
+- No service receives `/var/run/docker.sock` or the host user's complete home directory.
+
+## Modes
+
+### Base
+
+Use for clients such as Claude Code, Codex, Cursor and Cline running on other trusted machines. They connect to the OmniRoute LAN endpoint and authenticate with a client API key.
+
+```bash
+docker compose --profile base up -d
+```
+
+### Web
+
+Use when browser-backed providers require Chromium/Playwright.
+
+```bash
+docker compose --profile web up -d
+```
+
+### Agent
+
+Use when OmniRoute itself must execute CLIs and perform deployments.
+
+```bash
+mkdir -p data agent-workspace agent-home
+chmod 700 data agent-workspace agent-home
+docker compose --profile agent up -d
+```
+
+The agent can access the home LAN and Internet. Give it dedicated credentials inside `agent-home`, such as:
+
+- a restricted SSH key for deployment targets;
+- a kubeconfig bound to a least-privilege Kubernetes service account;
+- scoped tokens for Proxmox, Coolify, Forgejo/GitHub and deployment APIs;
+- known-host entries for SSH targets.
+
+Do not copy the host's entire `~/.ssh`, `~/.claude`, `~/.codex`, `~/.cursor` or other personal configuration into this directory. Authenticate each required CLI inside the dedicated agent home.
+
+The preferred deployment paths are SSH, HTTPS APIs, GitOps and the Kubernetes API. Direct access to the host Docker daemon is intentionally not provided because possession of the Docker socket is effectively root-equivalent on the host.
 
 ## First deployment
 
@@ -21,27 +59,34 @@ cp .env.security.example .env
 chmod 600 .env
 mkdir -p data
 chmod 700 data
-# Replace every REPLACE_* value before continuing.
+# Replace every REPLACE_* value.
+# Set OMNIROUTE_BIND_IP to the server address on your trusted VLAN.
 docker compose --profile base config
 docker compose --profile base up -d
 ```
 
-Do not expose ports `20128`, `20129` or `20132` directly. Put a TLS reverse proxy on the same host or access through an SSH tunnel. The proxy must authenticate users, strip query strings from access logs and apply request-size and rate limits.
+At the firewall, allow ports `20128`, `20129` and `20132` only from the VLANs or client addresses that need them. Block those ports from guest Wi-Fi, IoT VLANs and the Internet. Prefer internal DNS and TLS through the existing reverse proxy.
 
-## Required operational controls
+## Deployment authorization
 
-1. Run in a dedicated VM with encrypted storage and restricted backups.
-2. Restrict outbound traffic to the exact model providers in use; block RFC1918, link-local and cloud metadata destinations.
-3. Disable cloud sync in the database/dashboard as well as through environment variables.
-4. Keep MCP, A2A, plugins, custom middleware, MITM, VNC, Traffic Inspector and auto-update disabled until each feature is separately reviewed.
-5. Disable detailed call payloads and semantic caching for sensitive workloads; minimize retention.
-6. Rotate all provider and client keys after any test using privileged profiles from another branch.
-7. Re-run dependency, secret and container-image scanning on every update.
+Network reachability alone does not grant permission. Every infrastructure target should enforce its own identity and scope:
 
-## Deliberately unsupported in this Compose file
+1. Create a dedicated `omniroute-agent` account or service account.
+2. Allow only the deployment commands, namespaces, projects or stacks it needs.
+3. Keep destructive operations behind separate credentials or manual approval.
+4. Use SSH host-key verification and do not disable TLS verification.
+5. Record deployments and credential use in the target systems.
+6. Rotate agent credentials independently from personal administrator credentials.
 
-The upstream `cli` and `host` profiles grant access to the Docker socket, repository and AI-client credentials. They are intentionally absent. Reintroducing any of those mounts should be treated as granting the application host-level control.
+## Features and compatibility
+
+- External Claude Code/Codex/Cursor/Cline clients are supported through the LAN endpoint and API keys.
+- Normal model providers are supported because OmniRoute joins an egress-capable Docker network.
+- The `agent` profile restores packaged CLI execution without restoring Docker socket or host-home mounts.
+- Qdrant, Bifrost and CLIProxyAPI are available to OmniRoute internally when their profiles are enabled.
+- Cloud sync is disabled because the audited implementation may transmit provider and client credentials.
+- MCP, plugins, MITM, VNC, Traffic Inspector and custom middleware may be enabled only when required and should receive separate review and credentials.
 
 ## Residual risk
 
-This hardening reduces unsafe deployment defaults but does not prove the application safe. The codebase retains a large privileged surface, including outbound webhooks, local process execution, integrations and storage of sensitive model traffic. A dynamic pentest and runtime egress monitoring are still required before Internet exposure or use with regulated data.
+This configuration reduces unsafe deployment defaults but does not make a privileged autonomous agent risk-free. An agent with SSH, Kubernetes or infrastructure API credentials can perform whatever those credentials permit. Least privilege, network segmentation, backups, audit logs and tested rollback remain mandatory. Code-level findings from the security assessment, including webhook SSRF and sensitive-data handling, still require remediation before Internet exposure or regulated workloads.
